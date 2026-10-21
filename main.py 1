@@ -1,0 +1,202 @@
+@app.post("/crawl")
+def crawl(req: CrawlRequest):
+    urls = []
+
+    # Cách 1: Nhận danh sách URL sản phẩm trực tiếp
+    if req.product_urls:
+        for url in req.product_urls:
+            parsed = urlparse(url)
+
+            if (
+                parsed.scheme == "https"
+                and parsed.hostname == "www.coolmate.me"
+            ):
+                if url not in urls:
+                    urls.append(url)
+
+    # Cách 2: Đọc danh sách URL từ sitemap
+    elif req.sitemap_url:
+        parsed = urlparse(req.sitemap_url)
+
+        if (
+            parsed.scheme != "https"
+            or parsed.hostname != "www.coolmate.me"
+        ):
+            raise HTTPException(
+                status_code=400,
+                detail="Sitemap URL không hợp lệ"
+            )
+
+        try:
+            response = requests.get(
+                req.sitemap_url,
+                timeout=30
+            )
+            response.raise_for_status()
+
+            root = ET.fromstring(response.content)
+
+            for node in root.iter():
+                if node.tag.endswith("loc") and node.text:
+                    url = node.text.strip()
+                    parsed_url = urlparse(url)
+
+                    if (
+                        parsed_url.scheme == "https"
+                        and parsed_url.hostname == "www.coolmate.me"
+                        and url not in urls
+                    ):
+                        urls.append(url)
+
+        except requests.RequestException as e:
+            raise HTTPException(
+                status_code=502,
+                detail=f"Không truy cập được sitemap: {e}"
+            )
+        except ET.ParseError as e:
+            raise HTTPException(
+                status_code=502,
+                detail=f"Sitemap không đúng định dạng XML: {e}"
+            )
+
+    else:
+        raise HTTPException(
+            status_code=400,
+            detail="Vui lòng cung cấp product_urls hoặc sitemap_url"
+        )
+
+    # Giới hạn số sản phẩm cần xử lý
+    urls = urls[:max(1, min(req.max_products, 100))]
+
+    rows = []
+    failures = 0
+
+    # Truy cập từng trang sản phẩm
+    for i, url in enumerate(urls):
+        try:
+            page = requests.get(url, timeout=20)
+            page.raise_for_status()
+
+            soup = BeautifulSoup(page.text, "html.parser")
+
+            # Tên sản phẩm
+            title_tag = soup.find("meta", property="og:title")
+            if title_tag:
+                title = title_tag.get("content", "")
+            elif soup.title:
+                title = soup.title.get_text(" ", strip=True)
+            else:
+                title = ""
+
+            # Mô tả sản phẩm
+            description_tag = soup.find(
+                "meta",
+                attrs={"name": "description"}
+            )
+            description = (
+                description_tag.get("content", "")
+                if description_tag else ""
+            )
+
+            # Ảnh sản phẩm
+            image_tag = soup.find(
+                "meta",
+                property="og:image"
+            )
+            image = (
+                image_tag.get("content", "")
+                if image_tag else ""
+            )
+
+            # Giá sản phẩm
+            price_tag = soup.find(
+                "meta",
+                property="product:price:amount"
+            )
+            price = (
+                price_tag.get("content", "")
+                if price_tag else ""
+            )
+
+            # Nếu chưa có giá, thử đọc dữ liệu JSON-LD
+            if not price:
+                for script in soup.find_all(
+                    "script",
+                    type="application/ld+json"
+                ):
+                    try:
+                        data = json.loads(script.string or script.get_text())
+                        objects = data if isinstance(data, list) else [data]
+
+                        for obj in objects:
+                            if not isinstance(obj, dict):
+                                continue
+
+                            offers = obj.get("offers", {})
+                            if isinstance(offers, list):
+                                offers = offers[0] if offers else {}
+
+                            if isinstance(offers, dict) and offers.get("price") is not None:
+                                price = str(offers["price"])
+                                break
+
+                        if price:
+                            break
+
+                    except (json.JSONDecodeError, TypeError, AttributeError):
+                        continue
+
+            rows.append({
+                "URL": url,
+                "Tên sản phẩm": title,
+                "Giá": price,
+                "Mô tả": description,
+                "Ảnh": image,
+                "Trạng thái": "Thành công"
+            })
+
+        except requests.RequestException as e:
+            failures += 1
+            rows.append({
+                "URL": url,
+                "Tên sản phẩm": "",
+                "Giá": "",
+                "Mô tả": "",
+                "Ảnh": "",
+                "Trạng thái": f"Lỗi truy cập: {e}"
+            })
+
+        except Exception as e:
+            failures += 1
+            rows.append({
+                "URL": url,
+                "Tên sản phẩm": "",
+                "Giá": "",
+                "Mô tả": "",
+                "Ảnh": "",
+                "Trạng thái": f"Lỗi xử lý: {e}"
+            })
+
+        if i < len(urls) - 1:
+            time.sleep(max(1, min(req.delay_seconds, 10)))
+
+    # Xuất dữ liệu ra Excel
+    filename = f"coolmate_{uuid.uuid4().hex[:8]}.xlsx"
+    filepath = os.path.join(OUTPUT_DIR, filename)
+
+    pd.DataFrame(rows).to_excel(filepath, index=False)
+
+    # Trả kết quả cho API
+    base_url = os.getenv(
+        "PUBLIC_BASE_URL",
+        "https://coolmate-crawler.onrender.com"
+    ).rstrip("/")
+
+    return {
+        "status": "success",
+        "total_urls": len(urls),
+        "successful_pages": len(rows) - failures,
+        "failed_pages": failures,
+        "download_url": f"{base_url}/download/{filename}",
+        "filename": filename
+    }
